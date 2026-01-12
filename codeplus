@@ -1,0 +1,455 @@
+"""
+Azure Document Intelligence Wrapper with Query Support
+A comprehensive wrapper for extracting specific information from documents
+"""
+
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+from typing import Dict, List, Optional, Union, Any
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class AzureDocumentIntelligenceWrapper:
+    """Wrapper class for Azure Document Intelligence API with query support"""
+    
+    def __init__(self, endpoint: str, api_key: str):
+        """Initialize the Document Intelligence client"""
+        self.endpoint = endpoint
+        self.credential = AzureKeyCredential(api_key)
+        self.client = DocumentAnalysisClient(
+            endpoint=self.endpoint,
+            credential=self.credential
+        )
+        logger.info("Azure Document Intelligence client initialized")
+    
+    def analyze_document(
+        self,
+        document_path: Optional[str] = None,
+        document_url: Optional[str] = None,
+        model_id: str = "prebuilt-document",
+        locale: Optional[str] = None,
+        pages: Optional[str] = None,
+        query: Optional[Union[str, List[str]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Analyze a document and extract specific information based on query
+        
+        Args:
+            document_path: Local path to document file
+            document_url: URL to document
+            model_id: Model to use (prebuilt-document, prebuilt-layout, etc.)
+            locale: Document locale (e.g., "en-US")
+            pages: Page numbers to analyze (e.g., "1-3,5")
+            query: Specific words/phrases to extract. Examples:
+                   - Single term: "invoice number"
+                   - Multiple terms: ["customer name", "total amount", "date"]
+                   - Flexible matching: ["price", "cost", "amount"]
+        
+        Returns:
+            Dictionary with extracted information (filtered if query provided)
+        """
+        try:
+            if document_path and document_url:
+                raise ValueError("Provide either document_path or document_url, not both")
+            
+            if not document_path and not document_url:
+                raise ValueError("Must provide either document_path or document_url")
+            
+            if document_url:
+                logger.info(f"Analyzing document from URL: {document_url}")
+                poller = self.client.begin_analyze_document_from_url(
+                    model_id=model_id,
+                    document_url=document_url,
+                    locale=locale,
+                    pages=pages
+                )
+            else:
+                logger.info(f"Analyzing document from file: {document_path}")
+                with open(document_path, "rb") as document:
+                    poller = self.client.begin_analyze_document(
+                        model_id=model_id,
+                        document=document,
+                        locale=locale,
+                        pages=pages
+                    )
+            
+            result = poller.result()
+            logger.info("Document analysis completed successfully")
+            
+            processed_result = self._process_result(result, model_id)
+            
+            # Apply query filter if provided
+            if query:
+                logger.info(f"Filtering results by query: {query}")
+                processed_result = self._filter_by_query(processed_result, query)
+            
+            return processed_result
+        
+        except Exception as e:
+            logger.error(f"Error analyzing document: {str(e)}")
+            raise
+    
+    def _filter_by_query(
+        self, 
+        result: Dict[str, Any], 
+        query: Union[str, List[str]]
+    ) -> Dict[str, Any]:
+        """Filter extraction results based on query terms"""
+        if isinstance(query, str):
+            query_terms = [query.lower()]
+        else:
+            query_terms = [q.lower() for q in query]
+        
+        filtered_result = {
+            "model_id": result["model_id"],
+            "query_terms": query_terms,
+            "matched_content": [],
+            "matched_key_value_pairs": [],
+            "matched_entities": [],
+            "matched_tables": [],
+            "matched_lines": []
+        }
+        
+        # Search in full content
+        content = result.get("content", "")
+        content_lower = content.lower()
+        
+        for term in query_terms:
+            if term in content_lower:
+                contexts = self._extract_context(content, term)
+                filtered_result["matched_content"].extend(contexts)
+        
+        # Search in key-value pairs
+        for kv in result.get("key_value_pairs", []):
+            key = (kv.get("key") or "").lower()
+            value = (kv.get("value") or "").lower()
+            
+            for term in query_terms:
+                if term in key or term in value:
+                    filtered_result["matched_key_value_pairs"].append({
+                        "query_term": term,
+                        "key": kv.get("key"),
+                        "value": kv.get("value"),
+                        "confidence": kv.get("confidence")
+                    })
+                    break
+        
+        # Search in entities/fields
+        for entity in result.get("entities", []):
+            fields = entity.get("fields", {})
+            matched_fields = {}
+            
+            for field_name, field_data in fields.items():
+                field_name_lower = field_name.lower()
+                field_value = str(field_data.get("value", "")).lower()
+                field_content = str(field_data.get("content", "")).lower()
+                
+                for term in query_terms:
+                    if (term in field_name_lower or 
+                        term in field_value or 
+                        term in field_content):
+                        matched_fields[field_name] = field_data
+                        break
+            
+            if matched_fields:
+                filtered_result["matched_entities"].append({
+                    "doc_type": entity.get("doc_type"),
+                    "confidence": entity.get("confidence"),
+                    "fields": matched_fields
+                })
+        
+        # Search in tables
+        for idx, table in enumerate(result.get("tables", [])):
+            matched_cells = []
+            
+            for cell in table.get("cells", []):
+                cell_content = (cell.get("content") or "").lower()
+                
+                for term in query_terms:
+                    if term in cell_content:
+                        matched_cells.append({
+                            "query_term": term,
+                            "row": cell.get("row_index"),
+                            "column": cell.get("column_index"),
+                            "content": cell.get("content")
+                        })
+                        break
+            
+            if matched_cells:
+                filtered_result["matched_tables"].append({
+                    "table_index": idx,
+                    "matched_cells": matched_cells,
+                    "full_table": table
+                })
+        
+        # Search in page lines
+        for page in result.get("pages", []):
+            for line in page.get("lines", []):
+                line_content = line.get("content", "").lower()
+                
+                for term in query_terms:
+                    if term in line_content:
+                        filtered_result["matched_lines"].append({
+                            "query_term": term,
+                            "page_number": page.get("page_number"),
+                            "content": line.get("content"),
+                            "confidence": sum(w.get("confidence", 0) for w in line.get("words", [])) / max(len(line.get("words", [])), 1)
+                        })
+                        break
+        
+        # Add summary
+        filtered_result["summary"] = {
+            "total_matches": (
+                len(filtered_result["matched_content"]) +
+                len(filtered_result["matched_key_value_pairs"]) +
+                len(filtered_result["matched_entities"]) +
+                len(filtered_result["matched_tables"]) +
+                len(filtered_result["matched_lines"])
+            ),
+            "content_matches": len(filtered_result["matched_content"]),
+            "kv_matches": len(filtered_result["matched_key_value_pairs"]),
+            "entity_matches": len(filtered_result["matched_entities"]),
+            "table_matches": len(filtered_result["matched_tables"]),
+            "line_matches": len(filtered_result["matched_lines"])
+        }
+        
+        return filtered_result
+    
+    def _extract_context(
+        self, 
+        text: str, 
+        search_term: str, 
+        context_chars: int = 150
+    ) -> List[Dict[str, str]]:
+        """Extract text context around search terms"""
+        contexts = []
+        text_lower = text.lower()
+        search_term_lower = search_term.lower()
+        
+        start_pos = 0
+        while True:
+            pos = text_lower.find(search_term_lower, start_pos)
+            if pos == -1:
+                break
+            
+            context_start = max(0, pos - context_chars)
+            context_end = min(len(text), pos + len(search_term) + context_chars)
+            context = text[context_start:context_end]
+            
+            if context_start > 0:
+                context = "..." + context
+            if context_end < len(text):
+                context = context + "..."
+            
+            contexts.append({
+                "query_term": search_term,
+                "matched_text": text[pos:pos + len(search_term)],
+                "context": context,
+                "position": pos
+            })
+            
+            start_pos = pos + 1
+        
+        return contexts
+    
+    def _process_result(self, result, model_id: str) -> Dict[str, Any]:
+        """Process the analysis result into a structured format"""
+        processed = {
+            "model_id": model_id,
+            "content": result.content,
+            "pages": [],
+            "tables": [],
+            "key_value_pairs": [],
+            "entities": [],
+            "styles": []
+        }
+        
+        # Extract page information
+        for page in result.pages:
+            page_info = {
+                "page_number": page.page_number,
+                "width": page.width,
+                "height": page.height,
+                "unit": page.unit,
+                "angle": page.angle,
+                "lines": []
+            }
+            
+            if hasattr(page, 'lines'):
+                for line in page.lines:
+                    page_info["lines"].append({
+                        "content": line.content,
+                        "polygon": line.polygon,
+                        "words": [
+                            {"content": word.content, "confidence": word.confidence}
+                            for word in (line.words if hasattr(line, 'words') else [])
+                        ]
+                    })
+            
+            processed["pages"].append(page_info)
+        
+        # Extract tables
+        if hasattr(result, 'tables'):
+            for table in result.tables:
+                table_data = {
+                    "row_count": table.row_count,
+                    "column_count": table.column_count,
+                    "cells": []
+                }
+                
+                for cell in table.cells:
+                    table_data["cells"].append({
+                        "row_index": cell.row_index,
+                        "column_index": cell.column_index,
+                        "row_span": cell.row_span,
+                        "column_span": cell.column_span,
+                        "content": cell.content,
+                        "kind": cell.kind if hasattr(cell, 'kind') else None
+                    })
+                
+                processed["tables"].append(table_data)
+        
+        # Extract key-value pairs
+        if hasattr(result, 'key_value_pairs'):
+            for kv_pair in result.key_value_pairs:
+                processed["key_value_pairs"].append({
+                    "key": kv_pair.key.content if kv_pair.key else None,
+                    "value": kv_pair.value.content if kv_pair.value else None,
+                    "confidence": kv_pair.confidence
+                })
+        
+        # Extract entities
+        if hasattr(result, 'documents'):
+            for doc in result.documents:
+                doc_fields = {}
+                if hasattr(doc, 'fields'):
+                    for field_name, field_value in doc.fields.items():
+                        doc_fields[field_name] = self._extract_field_value(field_value)
+                
+                processed["entities"].append({
+                    "doc_type": doc.doc_type,
+                    "confidence": doc.confidence,
+                    "fields": doc_fields
+                })
+        
+        # Extract styles
+        if hasattr(result, 'styles'):
+            for style in result.styles:
+                processed["styles"].append({
+                    "is_handwritten": style.is_handwritten,
+                    "confidence": style.confidence
+                })
+        
+        return processed
+    
+    def _extract_field_value(self, field) -> Any:
+        """Extract value from a document field"""
+        if field is None:
+            return None
+        
+        field_data = {
+            "value": field.value if hasattr(field, 'value') else None,
+            "content": field.content if hasattr(field, 'content') else None,
+            "confidence": field.confidence if hasattr(field, 'confidence') else None,
+        }
+        
+        if hasattr(field, 'value_type'):
+            field_data["value_type"] = field.value_type
+        
+        return field_data
+    
+    def extract_specific_fields(
+        self,
+        document_path: Optional[str] = None,
+        document_url: Optional[str] = None,
+        fields: List[str] = None,
+        model_id: str = "prebuilt-document"
+    ) -> Dict[str, Any]:
+        """
+        Convenience method to extract specific fields from a document
+        
+        Args:
+            document_path: Local path to document
+            document_url: URL to document
+            fields: List of field names to extract (e.g., ["invoice number", "total", "date"])
+            model_id: Model to use
+        
+        Returns:
+            Dictionary with matched fields
+        """
+        return self.analyze_document(
+            document_path=document_path,
+            document_url=document_url,
+            model_id=model_id,
+            query=fields
+        )
+    
+    def save_result(self, result: Dict[str, Any], output_path: str) -> None:
+        """Save extraction result to JSON file"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            logger.info(f"Result saved to {output_path}")
+        except Exception as e:
+            logger.error(f"Error saving result: {str(e)}")
+            raise
+
+
+# Example usage
+if __name__ == "__main__":
+    ENDPOINT = "https://your-resource-name.cognitiveservices.azure.com/"
+    API_KEY = "your-api-key-here"
+    
+    doc_intel = AzureDocumentIntelligenceWrapper(endpoint=ENDPOINT, api_key=API_KEY)
+    
+    # Example 1: Extract specific single field
+    result = doc_intel.analyze_document(
+        document_path="invoice.pdf",
+        model_id="prebuilt-invoice",
+        query="invoice number"
+    )
+    print(f"Matches found: {result['summary']['total_matches']}")
+    
+    # Example 2: Extract multiple specific fields
+    result = doc_intel.analyze_document(
+        document_path="invoice.pdf",
+        model_id="prebuilt-invoice",
+        query=["invoice number", "total amount", "customer name", "date"]
+    )
+    
+    # Print matched key-value pairs
+    for match in result['matched_key_value_pairs']:
+        print(f"{match['key']}: {match['value']} (confidence: {match['confidence']:.2f})")
+    
+    # Example 3: Search for price-related terms
+    result = doc_intel.analyze_document(
+        document_path="receipt.pdf",
+        model_id="prebuilt-receipt",
+        query=["price", "cost", "amount", "total"]
+    )
+    
+    # Example 4: Extract specific data from tables
+    result = doc_intel.analyze_document(
+        document_path="report.pdf",
+        model_id="prebuilt-layout",
+        query=["revenue", "profit", "expenses"]
+    )
+    
+    # Print table matches
+    for table_match in result['matched_tables']:
+        print(f"\nTable {table_match['table_index']}:")
+        for cell in table_match['matched_cells']:
+            print(f"  Row {cell['row']}, Col {cell['column']}: {cell['content']}")
+    
+    # Example 5: Use convenience method
+    result = doc_intel.extract_specific_fields(
+        document_path="form.pdf",
+        fields=["name", "address", "phone", "email"]
+    )
+    
+    # Save results
+    doc_intel.save_result(result, "query_results.json")
